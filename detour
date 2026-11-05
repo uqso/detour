@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# detour - run Vesktop or Discord on Linux through the fastest working route.
+# detour - run Vesktop, Discord or Serein on Linux through the fastest working route.
 #
 # Vesktop and Discord are Electron (Chromium) apps, so they accept Chromium's
 # --proxy-server switch. With "proxy = auto" (the default) detour finds proxy
@@ -7,11 +7,17 @@
 # Discord and starts the client through whichever gets there first.
 # Proxies that need a login are routed through detour-auth-proxy.py, because
 # Chromium can't take proxy credentials on the command line.
+#
+# Serein is a native Rust client without Chromium switches: its REST API picks
+# up http(s)_proxy/all_proxy from the environment (when its API-proxy extension
+# is set to Automatic), so detour passes the winning route that way instead.
+# SOCKS upstreams and proxies with a login go through detour-auth-proxy.py,
+# which turns them into a plain local http proxy - the only kind Serein accepts.
 
 set -uo pipefail
 shopt -s extglob
 
-VERSION="1.0.3"
+VERSION="1.1.0"
 SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 DEFAULT_CONFIG="$CONFIG_HOME/detour/detour.ini"
@@ -31,13 +37,13 @@ TEST_URLS=(https://discord.com/api/v9/gateway https://gateway.discord.gg/cdn-cgi
 
 usage() {
   cat <<EOF
-detour $VERSION - run Vesktop or Discord through the fastest working route
+detour $VERSION - run Vesktop, Discord or Serein through the fastest working route
 
 Usage: detour [options] [-- arguments for the app]
 
 Options:
   -a, --app NAME        client to start: auto, vesktop, discord, discord-ptb,
-                        discord-canary (default: from config, else auto)
+                        discord-canary, serein (default: from config, else auto)
   -p, --proxy SPEC      use SPEC instead of the proxy setting in the config
   -c, --config FILE     config file (default: $DEFAULT_CONFIG)
       --check           test every route to Discord and show the best
@@ -442,7 +448,10 @@ client_info() {
     discord-canary)
       FLATPAK_ID=com.discordapp.DiscordCanary NATIVE_BIN=discord-canary
       MAIN_BINS="DiscordCanary" PRETTY="Discord Canary" ;;
-    *) die "unknown app '$1' (use auto, vesktop, discord, discord-ptb or discord-canary)" ;;
+    serein)
+      FLATPAK_ID=cz.viceverse.serein NATIVE_BIN=serein
+      MAIN_BINS="serein" PRETTY=Serein ;;
+    *) die "unknown app '$1' (use auto, vesktop, discord, discord-ptb, discord-canary or serein)" ;;
   esac
 }
 
@@ -461,13 +470,13 @@ resolve_client() {
 
 detect_client() {
   local app
-  for app in vesktop discord discord-ptb discord-canary; do
+  for app in vesktop discord discord-ptb discord-canary serein; do
     if resolve_client "$app"; then
       APP=$app
       return 0
     fi
   done
-  die "couldn't find Vesktop or Discord - install one of them first"
+  die "couldn't find Vesktop, Discord or Serein - install one of them first"
 }
 
 # find_main - find the client's main process; sets MAIN_PID and MAIN_CMDLINE.
@@ -495,12 +504,17 @@ find_main() {
 # client_running - is the client already open? Sets VIA_DETOUR to 1 if detour
 # started it: it then has --proxy-server or --no-proxy-server, or detour
 # started it earlier this session and it restarted itself without them
-# (Discord does after updates).
+# (Discord does after updates). Serein carries no such switches; detour marks
+# its environment instead.
 # Electron apps are single-instance: starting one again only brings the open
 # window to the front, and any new switches are ignored.
 client_running() {
   VIA_DETOUR=0
   find_main || return 1
+  if [[ $APP == serein ]]; then
+    [[ $(tr '\0' '\n' <"/proc/$MAIN_PID/environ" 2>/dev/null) == *DETOUR_SEREIN=1* || -e $STATE_DIR/$APP ]] && VIA_DETOUR=1
+    return 0
+  fi
   if [[ $MAIN_CMDLINE == *--proxy-server=* || $MAIN_CMDLINE == *--no-proxy-server* || -e $STATE_DIR/$APP ]]; then
     VIA_DETOUR=1
   fi
@@ -543,7 +557,7 @@ supervise() {
 # through the environment so the password doesn't show up in `ps`.
 start_auth_proxy() {
   local helper="$SELF_DIR/detour-auth-proxy.py" port=""
-  command -v python3 >/dev/null 2>&1 || die "a proxy with a login needs python3 installed"
+  command -v python3 >/dev/null 2>&1 || die "routing this proxy through detour's local helper needs python3 installed"
   [[ -f $helper ]] || die "missing $helper - reinstall detour"
   # $$ becomes the client with the exec below (or stays detour while it
   # supervises Discord), so the helper can watch it.
@@ -551,6 +565,67 @@ start_auth_proxy() {
   read -r -t 5 port <&"${AUTHPROXY[0]}" || true
   [[ $port =~ ^[0-9]+$ ]] || die "the login helper for the proxy didn't start"
   CHROME_PROXY="http://127.0.0.1:$port"
+}
+
+# ---------------------------------------------------------------- serein
+
+# Serein only follows the environment when its API-proxy extension is set to
+# Automatic (its built-in default is Direct). serein_extension_automatic
+# returns 0 when that setup is in place and 1 otherwise; the storage layout is
+# Serein's, so unknown layouts just get the hint.
+serein_extension_automatic() {
+  local root dir
+  if [[ $KIND == flatpak ]]; then
+    root="$HOME/.var/app/$FLATPAK_ID/data"
+  else
+    root="${XDG_DATA_HOME:-$HOME/.local/share}"
+  fi
+  for root in "$root/serein" "$root"; do
+    for dir in "$root/extensions/proxy-plugins/api-proxy" "$root/proxy-plugins/api-proxy"; do
+      if [[ -f $dir/data.json ]]; then
+        grep -Eq '"mode"[[:space:]]*:[[:space:]]*"automatic"' "$dir/data.json" && return 0
+        return 1
+      fi
+    done
+  done
+  return 1
+}
+
+# serein_launch - fill CMD with how Serein gets the chosen route. Serein has
+# no Chromium switches; its REST API reads http(s)_proxy/all_proxy from the
+# environment. Serein accepts only credential-free http(s) proxy URLs there,
+# so SOCKS routes and logins go through detour-auth-proxy.py, which exposes
+# them as a plain local http proxy. A direct route blanks the variables, so a
+# proxy exported in the shell can't override the race.
+serein_launch() {
+  local var
+  local -a env_args=()
+  local via_helper=""
+  if [[ -n $PROXY ]]; then
+    parse_proxy "$PROXY"
+    if [[ $P_SCHEME != http && $P_SCHEME != https ]] || [[ -n $P_USER ]]; then
+      via_helper=1
+      [[ $MODE == run ]] && start_auth_proxy
+    fi
+    for var in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+      env_args+=("$var=$CHROME_PROXY")
+    done
+  else
+    for var in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+      env_args+=("$var=")
+    done
+  fi
+  env_args+=("DETOUR_SEREIN=1")
+  if [[ $KIND == flatpak ]]; then
+    CMD=(flatpak run)
+    for var in "${env_args[@]}"; do CMD+=("--env=$var"); done
+    CMD+=("$FLATPAK_ID" "${APP_ARGS[@]}")
+  else
+    CMD=(env "${env_args[@]}" "$NATIVE_BIN" "${APP_ARGS[@]}")
+  fi
+  if [[ $MODE == print && -n $via_helper && -z ${AUTHPROXY_PID:-} ]]; then
+    echo "# the --env proxy above would point at detour's local login helper on 127.0.0.1 instead" >&2
+  fi
 }
 
 # ---------------------------------------------------------------- main
@@ -624,6 +699,12 @@ if [[ $MODE == check ]]; then
   echo "Testing routes to Discord..."
   if race_routes all; then
     echo "$PRETTY will connect through: $(route_label "$BEST")"
+    if [[ $APP == serein && $BEST != direct ]]; then
+      parse_proxy "$BEST"
+      if [[ $P_SCHEME != http && $P_SCHEME != https ]] || [[ -n $P_USER ]]; then
+        echo "  (through detour's local helper as an http proxy, the kind Serein accepts)"
+      fi
+    fi
   else
     echo "Nothing gets through to Discord. Start your proxy app or Cloudflare WARP and try again."
     exit 1
@@ -652,14 +733,21 @@ fi
 
 choose_route
 
-if [[ -n $PROXY ]]; then
-  parse_proxy "$PROXY"
-  [[ $MODE == run && -n $P_USER ]] && start_auth_proxy
-  FLAGS=("--proxy-server=$CHROME_PROXY")
+if [[ $APP == serein ]]; then
+  if [[ $MODE == run && -n $PROXY ]] && ! serein_extension_automatic; then
+    alert "One-time Serein setup: open its extension panel, enable the \"API proxy\" extension, choose Automatic and press Apply - otherwise Serein ignores the route detour picked."
+  fi
+  serein_launch
 else
-  FLAGS=(--no-proxy-server)
+  if [[ -n $PROXY ]]; then
+    parse_proxy "$PROXY"
+    [[ $MODE == run && -n $P_USER ]] && start_auth_proxy
+    FLAGS=("--proxy-server=$CHROME_PROXY")
+  else
+    FLAGS=(--no-proxy-server)
+  fi
+  CMD=("${BASE_CMD[@]}" "${FLAGS[@]}" "${APP_ARGS[@]}")
 fi
-CMD=("${BASE_CMD[@]}" "${FLAGS[@]}" "${APP_ARGS[@]}")
 
 if [[ $MODE == print ]]; then
   [[ -n $PROXY && -n $P_USER ]] && echo "# login proxy: a local helper on 127.0.0.1 would replace $CHROME_PROXY" >&2

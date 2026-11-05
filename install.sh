@@ -139,13 +139,14 @@ find_original() {
 }
 
 found=()
-for app in vesktop discord discord-ptb discord-canary; do
+for app in vesktop discord discord-ptb discord-canary serein; do
   read -r _ kind icon < <(DETOUR_CONFIG="$CONFIG" "$DETOUR" --app "$app" --detect 2>/dev/null) || continue
   case $app in
     vesktop) pretty=Vesktop ids="dev.vencord.Vesktop vesktop" ;;
     discord) pretty=Discord ids="com.discordapp.Discord discord discord-stable" ;;
     discord-ptb) pretty="Discord PTB" ids="com.discordapp.DiscordPTB discord-ptb" ;;
     discord-canary) pretty="Discord Canary" ids="com.discordapp.DiscordCanary discord-canary" ;;
+    serein) pretty=Serein ids="cz.viceverse.serein serein" ;;
   esac
   found+=("$pretty")
   separate_entry="$APPS_DIR/detour-$app.desktop"
@@ -189,8 +190,8 @@ done
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
 
 if ((${#found[@]} == 0)); then
-  echo "detour is installed, but Vesktop or Discord wasn't found." >&2
-  echo "Install Vesktop (flatpak install flathub dev.vencord.Vesktop), then run this again." >&2
+  echo "detour is installed, but no Discord client was found." >&2
+  echo "Install Vesktop (flatpak install flathub dev.vencord.Vesktop) or Serein, then run this again." >&2
   exit 1
 fi
 
